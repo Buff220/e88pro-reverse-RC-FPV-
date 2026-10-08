@@ -1,6 +1,6 @@
 """
 E88 Pro / RC UFO web controller  (protocol: github.com/CraxCurl/RC-Swamp working.md)
-+ YOLO human detection and human-follow autopilot
++ YOLO human detection, human-follow autopilot, search mode, and motion prediction
 
     pip install opencv-python numpy ultralytics
     1) join the drone's Wi-Fi   2) python e88pro_web.py   3) open http://localhost:8080
@@ -11,13 +11,19 @@ TEST WITH PROPELLERS REMOVED FIRST.
 Autopilot safety rules (built in):
   * Browser tab must stay open: if stick messages stop, everything goes neutral.
   * Moving either on-screen stick / WASD / arrows takes over instantly (autopilot pauses).
-  * No person in frame -> drone hovers (all sticks neutral).
+  * No fresh video frame -> drone hovers (autopilot sends neutral sticks, no turning).
+  * Person lost -> PREDICT (if enabled): keeps turning toward where they were moving,
+    for at most PRED_MAX_AGE seconds, never pushing forward on a prediction.
+  * Prediction over (or off) -> SEARCH (if enabled): turns toward the side the person
+    last went, in small steps. Otherwise the drone hovers.
   * SPACE / EMERGENCY LAND turns the autopilot off and lands.
   * Autopilot only steers yaw (+ optional altitude) and pushes forward. It does not
     take off or land by itself, and has no obstacle avoidance. Use a big open space.
 """
 import argparse, json, math, os, socket, threading, time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer|flags;low_delay"
 import cv2
@@ -27,8 +33,9 @@ DRONE_IP, CTRL_PORT = "192.168.1.1", 7099
 RTSP_URL = f"rtsp://{DRONE_IP}:7070/webcam"
 C = 128
 GEARS = {1: 40, 2: 60, 3: 127}
-STALE = 0.4      # no stick message for this long -> sticks go neutral (dead-man)
+STALE = 0.8      # no stick message for this long -> sticks go neutral (dead-man)
 TAKEOVER = 0.15  # manual stick deflection above this pauses the autopilot
+SLEW_RATE = 0.2  # max change per update cycle; slows acceleration (0..1 range)
 
 # ---- follow tuning ----
 KP_YAW, MAX_YAW = 0.9, 0.45     # yaw gain / max stick (0..1)
@@ -36,6 +43,26 @@ KP_THR, MAX_THR = 0.8, 0.40     # altitude gain / max stick (only if altitude al
 MIN_CMD = 0.10                  # smallest stick value worth sending when correcting
 FWD = 0.7                       # forward push as fraction of the selected speed gear
 RELEASE = 1.6                   # leave FORWARD and re-align if target is > RELEASE*radius from center
+
+# ---- frame-health tuning ----
+FRAME_STALE = 0.4     # no new video frame for this long -> autopilot hovers (neutral sticks)
+FRAME_MIN_FPS = 3.0   # frames slower than this are treated as a broken stream
+YAW_SCALE_MIN = 0.35  # yaw is scaled down to this when frames are arriving slowly
+DETECT_CONFIRM = 2    # consecutive detections needed before the autopilot moves again after a loss
+
+# ---- search tuning ----
+SEARCH_YAW = 0.10     # turn stick magnitude; the direction is picked automatically
+SEARCH_TURN = 0.35    # seconds turning per step
+SEARCH_PAUSE = 1.0    # seconds holding still so the camera can look
+SEARCH_MOVE_MIN = 0.05  # motion (fraction of frame per second) needed to trust the direction
+
+# ---- prediction tuning ----
+PRED_WINDOW = 0.8     # seconds of past detections used to estimate motion
+PRED_LEAD = 1.0       # max seconds to extrapolate ahead of the last sighting
+PRED_MAX_AGE = 1.5    # stop predicting this long after the person was last seen
+PRED_GAIN = 0.6       # predicted turns are gentler than live tracking
+
+LOST_STATES = ("LOST - HOVER", "SEARCH", "PREDICT", "NEED FRONT CAM", "NO VIDEO - HOVER", "-")
 
 
 class Drone:
@@ -48,6 +75,7 @@ class Drone:
         self.inp_t = 0.0
         self.auto_inp = None                     # autopilot sticks (roll, pitch, thr, yaw) or None
         self.auto_t = 0.0
+        self.slewed = (0.0, 0.0, 0.0, 0.0)       # smoothed sticks (slew-rate limited)
         self.gear, self.headless, self.cam = 1, False, 1
         self.once, self.lock_until = {}, 0.0
         self.sent = self.rx = 0
@@ -75,11 +103,19 @@ class Drone:
     def compute_axes(self):
         now = time.time()
         if now < self.lock_until or now - self.inp_t > STALE:   # lock or browser gone -> neutral
+            self.slewed = (0.0, 0.0, 0.0, 0.0)
             return (C, C, C, C)
         r, p, t, y = self.inp
         manual = max(abs(r), abs(p), abs(t), abs(y)) > TAKEOVER
         if not manual and self.auto_inp is not None and now - self.auto_t <= STALE:
             r, p, t, y = self.auto_inp
+        # Slew-rate limiting: smooth stick movements
+        sr, sp, st, sy = self.slewed
+        r = sr + max(-SLEW_RATE, min(SLEW_RATE, r - sr))
+        p = sp + max(-SLEW_RATE, min(SLEW_RATE, p - sp))
+        t = st + max(-SLEW_RATE, min(SLEW_RATE, t - st))
+        y = sy + max(-SLEW_RATE, min(SLEW_RATE, y - sy))
+        self.slewed = (r, p, t, y)
         d = GEARS[self.gear]
         cl = lambda v: max(-1.0, min(1.0, v))
         return (int(C + cl(r) * d), int(C + cl(p) * d), int(C + cl(t) * 127), int(C + cl(y) * 127))
@@ -126,23 +162,47 @@ class Drone:
 class Stream:
     def __init__(self, cam, last):
         self.cam, self.last, self.frame, self.run = cam, last, None, True
+        self.frame_t = 0.0        # wall-clock time the current frame was read
+        self.frame_n = 0          # increments on every new frame
+        self.fps = 0.0            # smoothed incoming frame rate
+        self.connected = False
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def age(self):
+        """Seconds since the last frame arrived (inf if none yet)."""
+        return time.time() - self.frame_t if self.frame_n else float("inf")
 
     def _loop(self):
         while self.run:
             cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-            if not cap.isOpened(): time.sleep(0.5); continue
+            if not cap.isOpened():
+                self.connected = False
+                time.sleep(0.5); continue
+            self.connected = True
+            t_prev, fails = time.time(), 0
             while self.run:
                 ok, f = cap.read()
-                if not ok: break
+                if not ok or f is None:
+                    fails += 1                      # count failed reads, reconnect after 15 in a row
+                    if fails >= 15: break
+                    time.sleep(0.02); continue
+                fails = 0
+                now = time.time()
+                self.fps = 0.8 * self.fps + 0.2 / max(1e-3, now - t_prev) if self.frame_n else 0.0
+                t_prev = now
                 self.frame = self.last[self.cam] = f
+                self.frame_t = now
+                self.frame_n += 1
             cap.release()
+            self.connected = False
+            self.frame_n = 0   # detector sees "no fresh frame" until reconnected
+            self.frame_t = 0.0
 
     def close(self): self.run = False
 
 
 class Detector:
-    """YOLO person detector (+ follow autopilot). modes: off | detect | follow"""
+    """YOLO person detector (+ follow, search and prediction autopilot). modes: off | detect | follow"""
 
     def __init__(self, model_path, imgsz, conf):
         self.model_path, self.imgsz, self.conf = model_path, imgsz, conf
@@ -155,13 +215,44 @@ class Detector:
         self.radius = 0.12              # circle radius as fraction of min(frame w,h)
         self.stop = 0.60                # stop advancing when person height >= this fraction of frame
         self.alt = False                # also align vertically with throttle
+        self.confirm = 0                # consecutive detections since last loss
+        self.search = False             # search mode on/off (GUI toggle)
+        self.search_phase = "turn"      # "turn" or "pause"
+        self.search_until = 0.0
+        self.search_dir = -1            # -1 = left, +1 = right; set when a search starts
+        self.predict_on = False         # prediction mode on/off (GUI toggle)
+        self.hist = deque(maxlen=12)    # recent (time, cx, cy, size) sightings, normalized
+        self.seen = None                # last sighting (cx, cy), normalized
+        self.seen_t = 0.0               # when the person was last seen
+        self.pred_px = None             # predicted point in pixels, for the overlay
+        self.stale = True
         threading.Thread(target=self._loop, daemon=True).start()
 
     def set_mode(self, m):
         self.mode = m
         self.state = "ALIGN" if m == "follow" else "-"
+        self.confirm = 0
+        self.reset_track()
         if m != "follow": drone.auto_inp = None
         if m == "off": self.boxes, self.persons = [], 0
+
+    def reset_track(self):
+        self.hist.clear()
+        self.seen, self.pred_px = None, None
+
+    def set_search(self, on):
+        self.search = on
+        if not on:
+            if self.state == "SEARCH": self.state = "LOST - HOVER"
+            drone.auto_inp = None
+
+    def set_predict(self, on):
+        self.predict_on = on
+        if not on:
+            self.pred_px = None
+            if self.state == "PREDICT":
+                self.state = "LOST - HOVER"
+                drone.auto_inp, drone.auto_t = (0, 0, 0, 0), time.time()
 
     def _load(self):
         self.loading = True
@@ -187,6 +278,9 @@ class Detector:
                     self.set_mode("off"); continue
             f = stream.frame
             if f is None or f is prev:
+                # no new frame yet: don't let the follower act on an old picture
+                if self.mode == "follow" and stream.age() > FRAME_STALE:
+                    self.hold("NO VIDEO - HOVER")
                 time.sleep(0.01); continue
             prev = f
             try:
@@ -202,7 +296,19 @@ class Detector:
             self.persons = len(dets)
             now = time.time()
             self.fps = 0.8 * self.fps + 0.2 / max(1e-3, now - t_prev); t_prev = now
-            if self.mode == "follow": self.follow(tgt, W, H, now)
+            if self.mode == "follow":
+                if stream.age() > FRAME_STALE or (0 < stream.fps < FRAME_MIN_FPS):
+                    # frames are missing or too slow: hover, do not steer on stale data
+                    self.hold("NO VIDEO - HOVER")
+                else:
+                    self.follow(tgt, W, H, now)
+
+    def hold(self, state):
+        """Neutral sticks, do not turn or push."""
+        self.state = state
+        self.stale = True
+        self.pred_px = None
+        drone.auto_inp, drone.auto_t = (0.0, 0.0, 0.0, 0.0), time.time()
 
     @staticmethod
     def _p(e, kp, mx, dz):
@@ -210,20 +316,114 @@ class Detector:
         v = max(-mx, min(mx, kp * e))
         return math.copysign(max(abs(v), MIN_CMD), v)
 
+    def record(self, now, cx, cy, size):
+        """Remember a sighting so the motion can be estimated later."""
+        self.hist.append((now, cx, cy, size))
+        self.seen, self.seen_t = (cx, cy), now
+
+    def velocity(self):
+        """Motion (dx/dt, dy/dt) in normalized units per second, from recent sightings."""
+        pts = [p for p in self.hist if self.seen_t - p[0] <= PRED_WINDOW]
+        if len(pts) < 2: return None
+        t0, x0, y0, _ = pts[0]
+        t1, x1, y1, _ = pts[-1]
+        span = t1 - t0
+        if span < 0.15: return None
+        return ((x1 - x0) / span, (y1 - y0) / span)
+
+    def predict_point(self, now):
+        """Where the person probably is now, or None if we can't or shouldn't guess."""
+        if self.seen is None: return None
+        dt = now - self.seen_t
+        if dt > PRED_MAX_AGE: return None
+        v = self.velocity()
+        if v is None: return None
+        lead = min(dt, PRED_LEAD)
+        cx, cy = self.seen
+        return (min(1.0, max(0.0, cx + v[0] * lead)),
+                min(1.0, max(0.0, cy + v[1] * lead)))
+
+    def predict_steer(self, W, H, now):
+        """Keep turning toward the predicted position. Returns False if there is no prediction."""
+        p = self.predict_point(now) if self.predict_on else None
+        if p is None: return False
+        px, py = p[0] * W, p[1] * H
+        self.pred_px = (px, py)
+        dx, dy = px - W / 2, py - H / 2
+        R = self.radius * min(W, H)
+        fps_scale = 1.0
+        if stream.fps > 0:
+            fps_scale = max(YAW_SCALE_MIN, min(1.0, stream.fps / 15.0))
+        g = PRED_GAIN * fps_scale
+        yaw = self._p(dx / (W / 2), KP_YAW * PRED_GAIN, MAX_YAW * g, 0.4 * R / (W / 2))
+        thr = self._p(-dy / (H / 2), KP_THR * PRED_GAIN, MAX_THR * PRED_GAIN, 0.4 * R / (H / 2)) if self.alt else 0.0
+        self.state = "PREDICT"
+        drone.auto_inp, drone.auto_t = (0.0, 0.0, thr, yaw), now   # no forward push on a guess
+        return True
+
+    def last_direction(self):
+        """Which way to search: -1 (left) or +1 (right), from the person's last motion.
+        Falls back to the side of the frame they were last seen on, then to left."""
+        v = self.velocity()
+        if v is not None and abs(v[0]) >= SEARCH_MOVE_MIN:
+            return -1 if v[0] < 0 else 1       # moving left in the image -> turn left
+        if self.seen is not None and abs(self.seen[0] - 0.5) > 0.02:
+            return -1 if self.seen[0] < 0.5 else 1
+        return -1
+
+    def run_search(self, now):
+        """Small turn toward the last known side, pause to look, repeat."""
+        if self.state != "SEARCH":
+            self.state = "SEARCH"
+            self.search_dir = self.last_direction()   # pick the side once, when search starts
+            self.search_phase = "turn"
+            self.search_until = now + SEARCH_TURN
+        if now >= self.search_until:
+            if self.search_phase == "turn":
+                self.search_phase, self.search_until = "pause", now + SEARCH_PAUSE
+            else:
+                self.search_phase, self.search_until = "turn", now + SEARCH_TURN
+        yaw = self.search_dir * SEARCH_YAW if self.search_phase == "turn" else 0.0
+        drone.auto_inp, drone.auto_t = (0.0, 0.0, 0.0, yaw), now
+
     def follow(self, tgt, W, H, now):
         if drone.cam != 1:                       # follow only works with the front camera
             self.state = "NEED FRONT CAM"; drone.auto_inp = None; return
-        if tgt is None:                          # lost -> hover
-            self.state = "LOST - HOVER"
-            drone.auto_inp, drone.auto_t = (0, 0, 0, 0), now
+        self.stale = False
+
+        if tgt is None:                          # nobody in view
+            self.confirm = 0
+            if self.predict_steer(W, H, now):    # 1) keep going the way they were moving
+                return
+            self.pred_px = None
+            if self.search:
+                self.run_search(now)             # 2) look around, toward their last side
+            else:
+                self.state = "LOST - HOVER"      # 3) nothing enabled: hover
+                drone.auto_inp, drone.auto_t = (0, 0, 0, 0), now
             return
+
         x1, y1, x2, y2, _ = tgt
+        self.record(now, (x1 + x2) / 2 / W, (y1 + y2) / 2 / H, (y2 - y1) / H)
+
+        # person seen: require a few consecutive hits before moving again after a loss
+        self.confirm += 1
+        if self.confirm < DETECT_CONFIRM and self.state in LOST_STATES:
+            if self.state == "PREDICT" and self.predict_steer(W, H, now):
+                pass                             # keep the predicted turn until confirmed
+            elif self.state == "SEARCH":
+                self.run_search(now)             # keep searching until confirmed
+            else:
+                drone.auto_inp, drone.auto_t = (0, 0, 0, 0), now
+            return
+
+        self.pred_px = None
         dx, dy = (x1 + x2) / 2 - W / 2, (y1 + y2) / 2 - H / 2
         R = self.radius * min(W, H)
         dist = math.hypot(dx, dy) if self.alt else abs(dx)
         size = (y2 - y1) / H
 
-        if self.state in ("ALIGN", "LOST - HOVER", "NEED FRONT CAM", "-"):
+        if self.state in LOST_STATES:
             self.state = "ALIGN"
         if self.state == "ALIGN" and dist <= R:
             self.state = "FORWARD"
@@ -233,9 +433,13 @@ class Detector:
             if size >= self.stop: self.state = "ARRIVED"
             elif self.state == "ARRIVED" and size < self.stop * 0.85: self.state = "FORWARD"
 
-        yaw = self._p(dx / (W / 2), KP_YAW, MAX_YAW, 0.4 * R / (W / 2))
+        # slow the turn down when the video frame rate is low
+        fps_scale = 1.0
+        if stream.fps > 0:
+            fps_scale = max(YAW_SCALE_MIN, min(1.0, stream.fps / 15.0))
+        yaw = self._p(dx / (W / 2), KP_YAW, MAX_YAW * fps_scale, 0.4 * R / (W / 2))
         thr = self._p(-dy / (H / 2), KP_THR, MAX_THR, 0.4 * R / (H / 2)) if self.alt else 0.0
-        pitch = FWD if self.state == "FORWARD" else 0.0
+        pitch = FWD * fps_scale if self.state == "FORWARD" else 0.0
         drone.auto_inp, drone.auto_t = (0.0, pitch, thr, yaw), now
 
 
@@ -254,7 +458,7 @@ def switch_camera(cam):
 
 
 def overlay(f):
-    """Draw detections + follow circle on a copy of the frame."""
+    """Draw detections, follow circle and predicted point on a copy of the frame."""
     if f is None or det.mode == "off": return f
     f = f.copy(); H, W = f.shape[:2]
     for x1, y1, x2, y2, c, is_t in det.boxes:
@@ -266,12 +470,16 @@ def overlay(f):
             cv2.line(f, (W // 2, H // 2), ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2), col, 1)
             cv2.circle(f, ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2), 5, col, -1)
     if det.mode == "follow":
-        col = {"FORWARD": (0, 220, 0), "ARRIVED": (255, 160, 0)}.get(det.state, (0, 200, 255))
+        col = {"FORWARD": (0, 220, 0), "ARRIVED": (255, 160, 0), "SEARCH": (255, 0, 255),
+               "PREDICT": (255, 255, 0)}.get(det.state, (0, 200, 255))
         cv2.circle(f, (W // 2, H // 2), int(det.radius * min(W, H)), col, 2)
         cv2.drawMarker(f, (W // 2, H // 2), col, cv2.MARKER_CROSS, 14, 1)
+        if det.state == "PREDICT" and det.pred_px is not None:
+            px, py = int(det.pred_px[0]), int(det.pred_px[1])
+            cv2.drawMarker(f, (px, py), col, cv2.MARKER_TILTED_CROSS, 18, 2)
     label = "loading model..." if det.loading else (f"FOLLOW: {det.state}" if det.mode == "follow" else "DETECT")
-    cv2.putText(f, f"{label}  persons:{det.persons}  {det.fps:.0f} fps", (8, H - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    cv2.putText(f, f"{label}  persons:{det.persons}  {det.fps:.0f} fps  video:{stream.fps:.0f} fps",
+                (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     return f
 
 
@@ -292,28 +500,23 @@ class H(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/":
+        url = urlparse(self.path)
+        if url.path == "/":
             self.send_body(PAGE.encode(), "text/html; charset=utf-8")
-        elif self.path == "/api/status":
+        elif url.path == "/api/status":
             self.send_body(json.dumps(dict(tx=drone.sent, rx=drone.rx, type=drone.dtype, cam=drone.cam,
                 gear=drone.gear, headless=drone.headless, axes=drone.axes,
                 locked=time.time() < drone.lock_until,
                 mode=det.mode, state=det.state, persons=det.persons, fps=round(det.fps, 1),
-                loading=det.loading)).encode(), "application/json")
-        elif self.path.startswith("/snap/"):
-            n = int(self.path.split("/")[2].split("?")[0])
-            self.send_body(jpeg(last.get(n), f"camera {n}: no frame yet"), "image/jpeg")
-        elif self.path.startswith("/video"):
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=f")
-            self.send_header("Cache-Control", "no-store"); self.end_headers()
-            try:
-                while True:
-                    b = jpeg(overlay(stream.frame))
-                    self.wfile.write(b"--f\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(b) + b + b"\r\n")
-                    time.sleep(0.04)
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                pass
+                search=det.search, predict=det.predict_on,
+                video_fps=round(stream.fps, 1), video_age=round(min(stream.age(), 99), 2),
+                connected=stream.connected, loading=det.loading)).encode(), "application/json")
+        elif url.path == "/frame":
+            # one JPEG per request: a stalled request just times out and the page asks again
+            n = int(parse_qs(url.query).get("cam", ["1"])[0])
+            f = stream.frame if n == stream.cam else last.get(n)
+            if n == 1: f = overlay(f)
+            self.send_body(jpeg(f, f"camera {n}: no frame yet"), "image/jpeg")
         else:
             self.send_body(b"not found", "text/plain", 404)
 
@@ -337,6 +540,10 @@ class H(BaseHTTPRequestHandler):
             elif c == "mode":
                 m = data.get("v", "off")
                 if m in ("off", "detect", "follow"): det.set_mode(m); print("[mode]", m)
+            elif c == "search":
+                det.set_search(bool(data.get("v", False))); print("[search]", det.search)
+            elif c == "predict":
+                det.set_predict(bool(data.get("v", False))); print("[predict]", det.predict_on)
             elif c == "cfg":
                 det.radius = max(0.03, min(0.45, float(data.get("radius", det.radius * 100)) / 100))
                 det.stop = max(0.2, min(0.95, float(data.get("stop", det.stop * 100)) / 100))
@@ -377,6 +584,8 @@ button:active{filter:brightness(1.3)}.g{background:#238636}.o{background:#d9730d
   <button class="g" onclick="cmd('takeoff')">TAKEOFF</button><button onclick="cmd('land')">LAND</button>
   <button class="ai" id="bd" onclick="toggleMode('detect')">👤 DETECT HUMAN</button>
   <button class="ai" id="bf" onclick="toggleMode('follow')">🎯 FOLLOW HUMAN</button>
+  <button class="ai" id="bs" onclick="toggleSearch()">🔍 SEARCH: OFF</button>
+  <button class="ai" id="bp" onclick="togglePredict()">🔮 PREDICT: OFF</button>
   <div class="cfg">
    <span>Circle</span><input type="range" id="rad" min="3" max="45" value="12" oninput="cfg()"><b id="radv">12%</b>
    <span>Stop at</span><input type="range" id="stp" min="20" max="95" value="60" oninput="cfg()"><b id="stpv">60%</b>
@@ -390,22 +599,52 @@ button:active{filter:brightness(1.3)}.g{background:#238636}.o{background:#d9730d
  <div class="joy" id="jR"><small style="top:6px;left:72px">FORWARD</small><small style="bottom:6px;left:78px">BACK</small><small style="top:90px;left:8px">LEFT</small><small style="top:90px;right:4px">RIGHT</small><div class="knob"></div></div>
 </div>
 <script>
-let cam=1,curMode='off',v={L:[0,0],R:[0,0]};
+let cam=1,curMode='off',searchOn=false,predictOn=false,v={L:[0,0],R:[0,0]},prevUrl={1:null,2:null};
 const post=(u,b)=>fetch(u,{method:'POST',body:JSON.stringify(b),keepalive:true}).catch(()=>{});
 const cmd=(c,x)=>post('/api/cmd',{cmd:c,v:x});
 const gear=n=>cmd('gear',n);
 function toggleMode(m){ if(m=='follow'&&curMode!='follow'&&cam!=1)setCam(1); cmd('mode',curMode==m?'off':m) }
+function toggleSearch(){ cmd('search',!searchOn) }
+function togglePredict(){ cmd('predict',!predictOn) }
 function cfg(){
  const r=+document.getElementById('rad').value,s=+document.getElementById('stp').value,a=document.getElementById('alt').checked;
  document.getElementById('radv').textContent=r+'%';document.getElementById('stpv').textContent=s+'%';
  post('/api/cmd',{cmd:'cfg',radius:r,stop:s,alt:a})}
 function setCam(n){cam=n;cmd('cam',n);render()}
+
+// Live view: request one JPEG at a time with a timeout. A stalled request is
+// aborted and retried, so the picture can't freeze the way a long MJPEG stream can.
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function pump(){
+ while(true){
+  const n=cam, im=document.getElementById('i'+n);
+  try{
+   const ctl=new AbortController(), to=setTimeout(()=>ctl.abort(),1500);
+   const r=await fetch('/frame?cam='+n+'&t='+Date.now(),{cache:'no-store',signal:ctl.signal});
+   clearTimeout(to);
+   if(r.ok){
+    const u=URL.createObjectURL(await r.blob());
+    if(n===cam){ im.src=u; if(prevUrl[n]) URL.revokeObjectURL(prevUrl[n]); prevUrl[n]=u; }
+    else URL.revokeObjectURL(u);
+   }
+  }catch(e){ await sleep(300); }
+  await sleep(50);
+ }
+}
+function refreshInactive(){
+ const o=cam==1?2:1, im=document.getElementById('i'+o);
+ if(prevUrl[o]){ URL.revokeObjectURL(prevUrl[o]); prevUrl[o]=null; }
+ im.src='/frame?cam='+o+'&t='+Date.now();
+}
 function render(){
- for(const n of [1,2]){document.getElementById('t'+n).classList.toggle('active',n==cam);
-  const im=document.getElementById('i'+n);
-  im.src = n==cam ? '/video?'+Date.now() : '/snap/'+n+'?'+Date.now();
-  document.getElementById('g'+n).textContent='CAM '+n+(n==1?' front':' bottom')+(n==cam?' · LIVE':' · last frame')}}
-setInterval(()=>{const o=cam==1?2:1;document.getElementById('i'+o).src='/snap/'+o+'?'+Date.now()},2500);
+ for(const n of [1,2]){
+  document.getElementById('t'+n).classList.toggle('active',n==cam);
+  document.getElementById('g'+n).textContent='CAM '+n+(n==1?' front':' bottom')+(n==cam?' · LIVE':' · last frame');
+ }
+ refreshInactive();
+}
+setInterval(refreshInactive,2500);
+
 function joy(id,key){
  const el=document.getElementById(id),k=el.querySelector('.knob'),R=61;let pid=null;
  const mv=e=>{const r=el.getBoundingClientRect();let dx=e.clientX-(r.left+r.width/2),dy=e.clientY-(r.top+r.height/2);
@@ -426,14 +665,20 @@ setInterval(()=>{ // 25 Hz stick stream; server zeroes sticks if this stops (als
  yl+=kk('KeyD','KeyA');tl+=kk('KeyW','KeyS');rr+=kk('ArrowRight','ArrowLeft');pr+=kk('ArrowUp','ArrowDown');
  post('/api/ctl',{yaw:yl,thr:tl,roll:rr,pitch:pr})},40);
 setInterval(async()=>{try{const s=await (await fetch('/api/status')).json();
- curMode=s.mode;
- let ai=s.mode=='off'?'':` · AI ${s.mode}${s.loading?' (loading model…)':''} ${s.mode=='follow'?s.state+' ':''}· ${s.persons} person · ${s.fps} fps`;
+ curMode=s.mode; searchOn=s.search; predictOn=s.predict;
+ let ai=s.mode=='off'?'':` · AI ${s.mode}${s.loading?' (loading model…)':''} ${s.mode=='follow'?s.state+' ':''}· ${s.persons} person · ${s.fps} fps · video ${s.video_fps} fps${s.video_age>0.4?' (stale '+s.video_age+'s)':''}`;
  document.getElementById('st').textContent=(s.rx?'● link OK':'○ no telemetry')+` · ${s.type==2?'GL':'Legacy'} · tx ${s.tx} rx ${s.rx} · R${s.axes[0]} P${s.axes[1]} T${s.axes[2]} Y${s.axes[3]}`+ai+(s.locked?' · EMERGENCY LANDING':'');
  [1,2,3].forEach(n=>document.getElementById('b'+n).classList.toggle('sel',s.gear==n));
  document.getElementById('bd').classList.toggle('sel',s.mode=='detect');
  document.getElementById('bf').classList.toggle('sel',s.mode=='follow');
+ const bs=document.getElementById('bs');
+ bs.classList.toggle('sel',s.search);
+ bs.textContent='🔍 SEARCH: '+(s.search?'ON':'OFF');
+ const bp=document.getElementById('bp');
+ bp.classList.toggle('sel',s.predict);
+ bp.textContent='🔮 PREDICT: '+(s.predict?'ON':'OFF');
  document.getElementById('hl').classList.toggle('sel',s.headless)}catch(e){document.getElementById('st').textContent='server offline'}},500);
-render();cfg();
+render();cfg();pump();
 </script></body></html>"""
 
 
